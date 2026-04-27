@@ -983,14 +983,28 @@ const PRCard: React.FC<{ pr: CommitLog }> = ({ pr }) => {
   );
 };
 
-const PR_ROWS_OPTIONS = [10, 25, 50] as const;
+// Rows-per-page options are view-mode specific. Card view uses multiples of
+// 3 so the 3-column responsive grid never renders an orphan row, while list
+// view keeps the familiar round-number options. The user's selection is
+// tracked by size index (small=0 / medium=1 / large=2) so toggling between
+// views preserves their small/medium/large preference instead of snapping
+// back to the default.
+const PR_ROWS_OPTIONS: Record<PRsViewMode, readonly [number, number, number]> =
+  {
+    list: [10, 25, 50],
+    cards: [12, 24, 48],
+  };
+
+type RowsSizeIndex = 0 | 1 | 2;
 
 const PRsList: React.FC<{ itemKeys: string[] }> = ({ itemKeys }) => {
   const { data: allPrs } = useAllPrs();
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<PrStatusFilter>('all');
   const [viewMode, setViewMode] = useState<PRsViewMode>('list');
-  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [rowsSize, setRowsSize] = useState<RowsSizeIndex>(0);
+  const rowsOptions = PR_ROWS_OPTIONS[viewMode];
+  const rowsPerPage = rowsOptions[rowsSize];
   const [page, setPage] = useState(0);
   const [sortField, setSortField] = useState<PrSortKey>('score');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
@@ -1125,9 +1139,9 @@ const PRsList: React.FC<{ itemKeys: string[] }> = ({ itemKeys }) => {
               Rows:
             </Typography>
             <Select
-              value={rowsPerPage}
+              value={rowsSize}
               onChange={(e) => {
-                setRowsPerPage(e.target.value as number);
+                setRowsSize(Number(e.target.value) as RowsSizeIndex);
                 setPage(0);
               }}
               sx={{
@@ -1143,8 +1157,8 @@ const PRsList: React.FC<{ itemKeys: string[] }> = ({ itemKeys }) => {
                 '& .MuiSelect-select': { py: 0.75 },
               }}
             >
-              {PR_ROWS_OPTIONS.map((n) => (
-                <MenuItem key={n} value={n}>
+              {rowsOptions.map((n, i) => (
+                <MenuItem key={n} value={i}>
                   {n}
                 </MenuItem>
               ))}
@@ -1178,7 +1192,15 @@ const PRsList: React.FC<{ itemKeys: string[] }> = ({ itemKeys }) => {
           }}
         />
         <Box sx={{ ml: 'auto' }}>
-          <PRsViewModeToggle viewMode={viewMode} onChange={setViewMode} />
+          <PRsViewModeToggle
+            viewMode={viewMode}
+            onChange={(mode) => {
+              setViewMode(mode);
+              // Reset to the first page so the user doesn't land on a
+              // now-empty page when the row count changes under them.
+              setPage(0);
+            }}
+          />
         </Box>
       </Box>
 
