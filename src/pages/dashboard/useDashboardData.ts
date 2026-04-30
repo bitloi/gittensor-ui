@@ -113,13 +113,8 @@ export const useDashboardData = (range: TrendTimeRange) => {
     featuredContributors,
     discoveryPulse,
     isDiscoveryPulseLoading:
-      datasets.prs.isLoading ||
-      datasets.miners.isLoading ||
-      datasets.issues.isLoading,
-    isDiscoveryPulseError:
-      datasets.prs.isError ||
-      datasets.miners.isError ||
-      datasets.issues.isError,
+      datasets.prs.isLoading || datasets.miners.isLoading,
+    isDiscoveryPulseError: datasets.prs.isError || datasets.miners.isError,
     isLoading:
       datasets.prs.isLoading ||
       datasets.miners.isLoading ||
