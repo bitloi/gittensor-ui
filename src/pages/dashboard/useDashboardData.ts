@@ -25,9 +25,9 @@ import {
   buildDashboardKpis,
   buildDashboardOverview,
   buildDashboardTrendData,
+  buildDailyDiscoveryPulse,
   buildFeaturedContributors,
   buildFeaturedWork,
-  buildFeaturedDiscoveryContributors,
   type TrendTimeRange,
 } from './dashboardData';
 
@@ -84,12 +84,8 @@ export const useDashboardData = (range: TrendTimeRange) => {
     [datasets.miners.data, datasets.prs.data],
   );
 
-  const featuredDiscoveryContributors = useMemo(
-    () =>
-      buildFeaturedDiscoveryContributors(
-        datasets.prs.data,
-        datasets.miners.data,
-      ),
+  const discoveryPulse = useMemo(
+    () => buildDailyDiscoveryPulse(datasets.prs.data, datasets.miners.data),
     [datasets.miners.data, datasets.prs.data],
   );
 
@@ -115,7 +111,15 @@ export const useDashboardData = (range: TrendTimeRange) => {
     featuredWork,
     isFeaturedWorkLoading,
     featuredContributors,
-    featuredDiscoveryContributors,
+    discoveryPulse,
+    isDiscoveryPulseLoading:
+      datasets.prs.isLoading ||
+      datasets.miners.isLoading ||
+      datasets.issues.isLoading,
+    isDiscoveryPulseError:
+      datasets.prs.isError ||
+      datasets.miners.isError ||
+      datasets.issues.isError,
     isLoading:
       datasets.prs.isLoading ||
       datasets.miners.isLoading ||

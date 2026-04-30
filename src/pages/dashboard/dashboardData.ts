@@ -13,7 +13,11 @@ import {
   type Repository,
 } from '../../api';
 import { type IssueBounty } from '../../api/models/Issues';
-import { getPrStatusLabel, parseNumber } from '../../utils';
+import {
+  getPrStatusLabel,
+  isIssueDiscoveryMultiplierPr,
+  parseNumber,
+} from '../../utils';
 
 export type PresetTimeRange = '1d' | '7d' | '35d';
 export type TrendTimeRange = PresetTimeRange | 'all';
@@ -70,6 +74,37 @@ export interface DashboardFeaturedContributor {
   segments?: Array<{ label: string; value: number }>;
 }
 
+export interface DashboardDiscoveryKpi {
+  label: string;
+  value: string;
+  delta?: string;
+  tone?: 'positive' | 'neutral' | 'warning';
+}
+
+export interface DashboardFeaturedDiscoverer {
+  id: string;
+  githubId?: string;
+  githubUsername?: string;
+  name: string;
+  avatarUsername?: string;
+  roleLabel: string;
+  primaryMetric: string;
+  primaryMetricLabel: string;
+  secondaryMetric?: string;
+  secondaryMetricLabel?: string;
+  repos: string[];
+  href?: string;
+  tone?: 'success' | 'neutral' | 'warning';
+  issueCredibility?: number;
+}
+
+export interface DashboardDiscoveryPulse {
+  windowLabel: string;
+  kpis: DashboardDiscoveryKpi[];
+  discoverers: DashboardFeaturedDiscoverer[];
+  isFallback: boolean;
+}
+
 type FeaturedWorkStatusTone = 'merged' | 'open' | 'closed';
 
 export interface FeaturedWorkPr {
@@ -121,7 +156,7 @@ const TREND_SERIES_KEYS: TrendSeriesKey[] = [
 ];
 const CURRENT_LOOKBACK_WINDOW: PresetTimeRange = '35d';
 
-type WindowBounds = {
+export type WindowBounds = {
   startMs: number;
   endMs: number;
 };
@@ -906,6 +941,747 @@ export const buildFeaturedWork = (
       ]): FeaturedWorkRepo => buildRepoEntry(repoPrs, totalScore, config),
     );
 };
+
+interface DailyDiscovererStats {
+  key: string;
+  githubId?: string;
+  githubUsername?: string;
+  name: string;
+  avatarUsername?: string;
+  repos: Set<string>;
+  linkedIssuesOpened: number;
+  discoveryPrsMerged: number;
+  discoveryScore: number;
+  highestDiscoveryPrScore: number;
+  fastestCloseMs?: number;
+  lastActivityMs: number;
+  baselineIssueScore: number;
+  baselineSolvedIssues: number;
+  baselineIssueCredibility: number;
+}
+
+interface DailyActorIdentity {
+  miner?: MinerEvaluation;
+  githubId?: string;
+  githubUsername?: string;
+  hotkey?: string;
+}
+
+interface DailyActivitySnapshot {
+  linkedIssuesOpened: number;
+  discoveryPrsMerged: number;
+  discoveryScore: number;
+  repos: Set<string>;
+  discoverers: Map<string, DailyDiscovererStats>;
+}
+
+interface MinerIndexes {
+  byGithubId: Map<string, MinerEvaluation>;
+  byUsername: Map<string, MinerEvaluation>;
+  byHotkey: Map<string, MinerEvaluation>;
+}
+
+const DAILY_DISCOVERY_WINDOW_HOURS = 24;
+
+export const getRollingWindowBounds = (
+  now = new Date(),
+  windowHours = DAILY_DISCOVERY_WINDOW_HOURS,
+): WindowBounds => {
+  const endMs = now.getTime();
+  return {
+    startMs: endMs - windowHours * HOUR_MS,
+    endMs,
+  };
+};
+
+export const getPreviousRollingWindowBounds = (
+  now = new Date(),
+  windowHours = DAILY_DISCOVERY_WINDOW_HOURS,
+): WindowBounds => {
+  const current = getRollingWindowBounds(now, windowHours);
+  const windowMs = windowHours * HOUR_MS;
+  return {
+    startMs: current.startMs - windowMs,
+    endMs: current.startMs,
+  };
+};
+
+const normalizeLookupValue = (value?: string | null) =>
+  value?.trim().toLowerCase() ?? '';
+
+const buildMinerIndexes = (miners: MinerEvaluation[]): MinerIndexes => {
+  const indexes: MinerIndexes = {
+    byGithubId: new Map(),
+    byUsername: new Map(),
+    byHotkey: new Map(),
+  };
+
+  miners.forEach((miner) => {
+    if (miner.githubId) {
+      indexes.byGithubId.set(miner.githubId, miner);
+    }
+
+    const usernameKey = normalizeLookupValue(miner.githubUsername);
+    if (usernameKey) {
+      indexes.byUsername.set(usernameKey, miner);
+    }
+
+    if (miner.hotkey) {
+      indexes.byHotkey.set(miner.hotkey, miner);
+    }
+  });
+
+  return indexes;
+};
+
+const shortHotkey = (hotkey: string) => {
+  if (hotkey.length <= 14) return hotkey;
+  return `${hotkey.slice(0, 6)}...${hotkey.slice(-4)}`;
+};
+
+const getMinerDetailsHref = (githubId?: string) =>
+  githubId
+    ? `/miners/details?githubId=${encodeURIComponent(
+        githubId,
+      )}&mode=issues&tab=open-issues`
+    : undefined;
+
+const resolveUsernameActor = (
+  username: string | null | undefined,
+  indexes: MinerIndexes,
+): DailyActorIdentity | null => {
+  const normalizedUsername = normalizeLookupValue(username);
+  if (!normalizedUsername) return null;
+
+  const miner = indexes.byUsername.get(normalizedUsername);
+  return {
+    miner,
+    githubId: miner?.githubId,
+    githubUsername: miner?.githubUsername ?? username?.trim(),
+  };
+};
+
+const resolveGithubIdActor = (
+  githubId: string | null | undefined,
+  indexes: MinerIndexes,
+): DailyActorIdentity | null => {
+  if (!githubId) return null;
+
+  const miner = indexes.byGithubId.get(githubId);
+  return {
+    miner,
+    githubId,
+    githubUsername: miner?.githubUsername,
+  };
+};
+
+const resolvePrActor = (
+  pr: CommitLog,
+  indexes: MinerIndexes,
+): DailyActorIdentity | null => {
+  if (pr.githubId) {
+    const miner = indexes.byGithubId.get(pr.githubId);
+    return {
+      miner,
+      githubId: pr.githubId,
+      githubUsername: miner?.githubUsername ?? pr.author,
+    };
+  }
+
+  return resolveUsernameActor(pr.author, indexes);
+};
+
+const getDailyActorKey = (identity: DailyActorIdentity): string | null => {
+  if (identity.miner?.githubId) return `github:${identity.miner.githubId}`;
+  if (identity.githubId) return `github:${identity.githubId}`;
+
+  const usernameKey = normalizeLookupValue(identity.githubUsername);
+  if (usernameKey) return `user:${usernameKey}`;
+
+  if (identity.hotkey) return `hotkey:${identity.hotkey}`;
+  return null;
+};
+
+const ensureDailyDiscoverer = (
+  discoverers: Map<string, DailyDiscovererStats>,
+  identity: DailyActorIdentity,
+): DailyDiscovererStats | null => {
+  const key = getDailyActorKey(identity);
+  if (!key) return null;
+
+  const existing = discoverers.get(key);
+  if (existing) return existing;
+
+  const miner = identity.miner;
+  const githubId = miner?.githubId ?? identity.githubId;
+  const githubUsername = miner?.githubUsername ?? identity.githubUsername;
+  const name =
+    githubUsername ?? githubId ?? shortHotkey(identity.hotkey ?? key);
+  const baselineSolvedIssues = parseNumber(
+    miner?.totalValidSolvedIssues ?? miner?.totalSolvedIssues,
+  );
+
+  const stats: DailyDiscovererStats = {
+    key,
+    githubId,
+    githubUsername,
+    name,
+    avatarUsername: githubUsername,
+    repos: new Set(),
+    linkedIssuesOpened: 0,
+    discoveryPrsMerged: 0,
+    discoveryScore: 0,
+    highestDiscoveryPrScore: 0,
+    lastActivityMs: 0,
+    baselineIssueScore: parseNumber(miner?.issueDiscoveryScore),
+    baselineSolvedIssues,
+    baselineIssueCredibility: parseNumber(miner?.issueCredibility),
+  };
+
+  discoverers.set(key, stats);
+  return stats;
+};
+
+const addRepoContext = (
+  stats: DailyDiscovererStats,
+  repositoryFullName?: string | null,
+) => {
+  if (repositoryFullName) {
+    stats.repos.add(repositoryFullName);
+  }
+};
+
+const updateLastActivity = (
+  stats: DailyDiscovererStats,
+  timestamp: number | null,
+) => {
+  if (timestamp !== null) {
+    stats.lastActivityMs = Math.max(stats.lastActivityMs, timestamp);
+  }
+};
+
+const getLinkedIssueKey = (repositoryFullName: string, issueNumber: number) =>
+  `${repositoryFullName.toLowerCase()}#${issueNumber}`;
+
+const getDiscoveryPrScore = (pr: CommitLog) => {
+  const tokenScore = parseNumber(pr.tokenScore);
+  return tokenScore > 0 ? tokenScore : parseNumber(pr.score);
+};
+
+const buildDailyActivitySnapshot = (
+  prs: CommitLog[],
+  miners: MinerEvaluation[],
+  window: WindowBounds,
+): DailyActivitySnapshot => {
+  const indexes = buildMinerIndexes(miners);
+  const discoverers = new Map<string, DailyDiscovererStats>();
+  const seenLinkedIssues = new Set<string>();
+  const snapshot: DailyActivitySnapshot = {
+    linkedIssuesOpened: 0,
+    discoveryPrsMerged: 0,
+    discoveryScore: 0,
+    repos: new Set(),
+    discoverers,
+  };
+
+  prs.forEach((pr) => {
+    const mergedAt = toTimestamp(pr.mergedAt);
+    if (
+      !isWithinWindow(mergedAt, window) ||
+      !isIssueDiscoveryMultiplierPr(pr)
+    ) {
+      return;
+    }
+
+    const identity = resolvePrActor(pr, indexes);
+    const score = getDiscoveryPrScore(pr);
+
+    snapshot.discoveryPrsMerged += 1;
+    snapshot.discoveryScore += score;
+    if (pr.repository) snapshot.repos.add(pr.repository);
+
+    const prStats = identity
+      ? ensureDailyDiscoverer(discoverers, identity)
+      : null;
+    if (prStats) {
+      prStats.discoveryPrsMerged += 1;
+      prStats.discoveryScore += score;
+      prStats.highestDiscoveryPrScore = Math.max(
+        prStats.highestDiscoveryPrScore,
+        score,
+      );
+      addRepoContext(prStats, pr.repository);
+      updateLastActivity(prStats, mergedAt);
+    }
+
+    pr.linkedIssues?.forEach((issue) => {
+      const createdAt = toTimestamp(issue.createdAt);
+      if (!isWithinWindow(createdAt, window)) return;
+
+      const repoFullName = pr.repository;
+      if (!repoFullName) return;
+
+      const key = getLinkedIssueKey(repoFullName, issue.number);
+      if (seenLinkedIssues.has(key)) return;
+      seenLinkedIssues.add(key);
+      snapshot.linkedIssuesOpened += 1;
+
+      const issueIdentity = resolveGithubIdActor(issue.authorGithubId, indexes);
+      if (!issueIdentity) return;
+
+      const issueStats = ensureDailyDiscoverer(discoverers, issueIdentity);
+      if (!issueStats) return;
+
+      issueStats.linkedIssuesOpened += 1;
+      addRepoContext(issueStats, repoFullName);
+      updateLastActivity(issueStats, createdAt);
+
+      if (createdAt !== null && mergedAt !== null) {
+        const closeDurationMs = mergedAt - createdAt;
+        if (closeDurationMs >= 0) {
+          issueStats.fastestCloseMs =
+            issueStats.fastestCloseMs === undefined
+              ? closeDurationMs
+              : Math.min(issueStats.fastestCloseMs, closeDurationMs);
+        }
+      }
+    });
+  });
+
+  return snapshot;
+};
+
+const formatWholeNumber = (value: number) =>
+  Math.round(value).toLocaleString('en-US');
+
+const formatDailyDelta = (currentValue: number, previousValue: number) => {
+  if (currentValue === previousValue) return 'flat vs prev 24h';
+  if (previousValue <= 0) {
+    return currentValue > 0 ? 'new vs prev 24h' : 'flat vs prev 24h';
+  }
+
+  const percentChange = ((currentValue - previousValue) / previousValue) * 100;
+  const rounded = percentChange
+    .toFixed(Math.abs(percentChange) >= 10 ? 0 : 1)
+    .replace(/\.0$/, '');
+
+  return `${percentChange > 0 ? '+' : ''}${rounded}% vs prev 24h`;
+};
+
+const getDailyKpiTone = (
+  currentValue: number,
+  previousValue: number,
+): DashboardDiscoveryKpi['tone'] => {
+  if (currentValue > previousValue) return 'positive';
+  if (currentValue < previousValue) return 'warning';
+  return 'neutral';
+};
+
+const totalDailyActivity = (stats: DailyDiscovererStats) =>
+  stats.linkedIssuesOpened + stats.discoveryPrsMerged;
+
+const sortRepos = (repos: Set<string>) =>
+  [...repos].sort((a, b) => a.localeCompare(b));
+
+const formatIssueCount = (value: number, singular: string) =>
+  `${formatWholeNumber(value)} ${singular}${value === 1 ? '' : 's'}`;
+
+const formatDuration = (durationMs: number) => {
+  if (durationMs < HOUR_MS) {
+    return `${Math.max(1, Math.round(durationMs / (60 * 1000)))}m`;
+  }
+
+  if (durationMs < DAY_MS) {
+    return `${(durationMs / HOUR_MS).toFixed(1).replace(/\.0$/, '')}h`;
+  }
+
+  return `${(durationMs / DAY_MS).toFixed(1).replace(/\.0$/, '')}d`;
+};
+
+const toDailyDiscoverer = (
+  stats: DailyDiscovererStats,
+  roleLabel: string,
+  primaryMetric: string,
+  primaryMetricLabel: string,
+  options?: {
+    secondaryMetric?: string;
+    secondaryMetricLabel?: string;
+    tone?: DashboardFeaturedDiscoverer['tone'];
+  },
+): DashboardFeaturedDiscoverer => ({
+  id: stats.key,
+  githubId: stats.githubId,
+  githubUsername: stats.githubUsername,
+  name: stats.name,
+  avatarUsername: stats.avatarUsername,
+  roleLabel,
+  primaryMetric,
+  primaryMetricLabel,
+  secondaryMetric: options?.secondaryMetric,
+  secondaryMetricLabel: options?.secondaryMetricLabel,
+  repos: sortRepos(stats.repos),
+  href: getMinerDetailsHref(stats.githubId),
+  tone: options?.tone ?? 'success',
+  issueCredibility: stats.baselineIssueCredibility,
+});
+
+export const pickTopDailyIssueScout = (
+  stats: DailyDiscovererStats[],
+  exclude: Set<string> = new Set(),
+): DashboardFeaturedDiscoverer | undefined => {
+  const top = [...stats]
+    .filter((entry) => entry.linkedIssuesOpened > 0 && !exclude.has(entry.key))
+    .sort((a, b) => {
+      const issueDiff = b.linkedIssuesOpened - a.linkedIssuesOpened;
+      if (issueDiff !== 0) return issueDiff;
+
+      const baselineDiff = b.baselineIssueScore - a.baselineIssueScore;
+      if (baselineDiff !== 0) return baselineDiff;
+
+      return b.lastActivityMs - a.lastActivityMs;
+    })[0];
+
+  if (!top) return undefined;
+
+  return toDailyDiscoverer(
+    top,
+    'Top 24h Issue Scout',
+    formatIssueCount(top.linkedIssuesOpened, 'linked issue'),
+    'opened in 24h',
+    {
+      secondaryMetric: formatWholeNumber(top.baselineIssueScore),
+      secondaryMetricLabel: 'baseline score',
+    },
+  );
+};
+
+export const pickTopDailySolver = (
+  stats: DailyDiscovererStats[],
+  exclude: Set<string> = new Set(),
+): DashboardFeaturedDiscoverer | undefined => {
+  const top = [...stats]
+    .filter((entry) => entry.discoveryPrsMerged > 0 && !exclude.has(entry.key))
+    .sort((a, b) => {
+      const solvedDiff = b.discoveryPrsMerged - a.discoveryPrsMerged;
+      if (solvedDiff !== 0) return solvedDiff;
+
+      const scoreDiff = b.discoveryScore - a.discoveryScore;
+      if (scoreDiff !== 0) return scoreDiff;
+
+      const baselineDiff = b.baselineSolvedIssues - a.baselineSolvedIssues;
+      if (baselineDiff !== 0) return baselineDiff;
+
+      return b.lastActivityMs - a.lastActivityMs;
+    })[0];
+
+  if (!top) return undefined;
+
+  return toDailyDiscoverer(
+    top,
+    'Most 24h Discovery Solves',
+    formatIssueCount(top.discoveryPrsMerged, 'solve'),
+    'merged discovery PRs',
+    {
+      secondaryMetric: formatWholeNumber(top.discoveryScore),
+      secondaryMetricLabel: '24h discovery score',
+    },
+  );
+};
+
+export const pickTopIssueLinkedPrContributor = (
+  stats: DailyDiscovererStats[],
+  exclude: Set<string> = new Set(),
+): DashboardFeaturedDiscoverer | undefined => {
+  const top = [...stats]
+    .filter((entry) => entry.discoveryPrsMerged > 0 && !exclude.has(entry.key))
+    .sort((a, b) => {
+      const scoreDiff = b.highestDiscoveryPrScore - a.highestDiscoveryPrScore;
+      if (scoreDiff !== 0) return scoreDiff;
+
+      const mergedDiff = b.discoveryPrsMerged - a.discoveryPrsMerged;
+      if (mergedDiff !== 0) return mergedDiff;
+
+      return b.lastActivityMs - a.lastActivityMs;
+    })[0];
+
+  if (!top) return undefined;
+
+  const hasScore = top.highestDiscoveryPrScore > 0;
+  return toDailyDiscoverer(
+    top,
+    'Highest 24h Discovery PR',
+    hasScore
+      ? formatWholeNumber(top.highestDiscoveryPrScore)
+      : formatIssueCount(top.discoveryPrsMerged, 'PR'),
+    hasScore ? 'top discovery PR score' : 'merged discovery PRs',
+    {
+      secondaryMetric: formatIssueCount(top.discoveryPrsMerged, 'PR'),
+      secondaryMetricLabel: 'merged discovery PRs',
+    },
+  );
+};
+
+const pickFastestCloser = (
+  stats: DailyDiscovererStats[],
+  exclude: Set<string> = new Set(),
+): DashboardFeaturedDiscoverer | undefined => {
+  const top = [...stats]
+    .filter(
+      (entry) =>
+        entry.fastestCloseMs !== undefined &&
+        (entry.linkedIssuesOpened > 0 || entry.discoveryPrsMerged > 0) &&
+        !exclude.has(entry.key),
+    )
+    .sort((a, b) => {
+      const closeDiff = (a.fastestCloseMs ?? 0) - (b.fastestCloseMs ?? 0);
+      if (closeDiff !== 0) return closeDiff;
+
+      const solvedDiff = b.discoveryPrsMerged - a.discoveryPrsMerged;
+      if (solvedDiff !== 0) return solvedDiff;
+
+      return b.lastActivityMs - a.lastActivityMs;
+    })[0];
+
+  if (!top || top.fastestCloseMs === undefined) return undefined;
+
+  return toDailyDiscoverer(
+    top,
+    'Fastest Closer',
+    formatDuration(top.fastestCloseMs),
+    'linked issue to merge',
+    {
+      secondaryMetric: formatIssueCount(top.discoveryPrsMerged, 'solve'),
+      secondaryMetricLabel: 'merged discovery PRs',
+    },
+  );
+};
+
+const pickDiscoveryMomentum = (
+  stats: DailyDiscovererStats[],
+  exclude: Set<string> = new Set(),
+): DashboardFeaturedDiscoverer | undefined => {
+  const top = [...stats]
+    .filter((entry) => totalDailyActivity(entry) > 0 && !exclude.has(entry.key))
+    .sort((a, b) => {
+      const activityDiff = totalDailyActivity(b) - totalDailyActivity(a);
+      if (activityDiff !== 0) return activityDiff;
+
+      const baselineDiff = b.baselineIssueScore - a.baselineIssueScore;
+      if (baselineDiff !== 0) return baselineDiff;
+
+      return b.lastActivityMs - a.lastActivityMs;
+    })[0];
+
+  if (!top) return undefined;
+
+  return toDailyDiscoverer(
+    top,
+    'Discovery Momentum',
+    formatWholeNumber(totalDailyActivity(top)),
+    '24h discovery events',
+    {
+      secondaryMetric: formatWholeNumber(top.baselineIssueScore),
+      secondaryMetricLabel: 'baseline score',
+      tone: 'neutral',
+    },
+  );
+};
+
+const buildDailyDiscovererRows = (
+  snapshot: DailyActivitySnapshot,
+): DashboardFeaturedDiscoverer[] => {
+  const stats = [...snapshot.discoverers.values()];
+  const seen = new Set<string>();
+  const rows: DashboardFeaturedDiscoverer[] = [];
+  const pickers: Array<
+    (
+      entries: DailyDiscovererStats[],
+      exclude: Set<string>,
+    ) => DashboardFeaturedDiscoverer | undefined
+  > = [
+    pickTopDailyIssueScout,
+    pickTopDailySolver,
+    pickTopIssueLinkedPrContributor,
+    pickFastestCloser,
+    pickDiscoveryMomentum,
+  ];
+
+  pickers.forEach((pick) => {
+    const row = pick(stats, seen);
+    if (!row) return;
+
+    seen.add(row.id);
+    rows.push(row);
+  });
+
+  return rows;
+};
+
+const buildBaselineDiscoverers = (
+  miners: MinerEvaluation[],
+): DashboardFeaturedDiscoverer[] =>
+  [...miners]
+    .filter(
+      (miner) =>
+        miner.isIssueEligible &&
+        (parseNumber(miner.issueDiscoveryScore) > 0 ||
+          parseNumber(miner.totalSolvedIssues) > 0 ||
+          parseNumber(miner.totalOpenIssues) > 0 ||
+          parseNumber(miner.totalClosedIssues) > 0),
+    )
+    .sort((a, b) => {
+      const scoreDiff =
+        parseNumber(b.issueDiscoveryScore) - parseNumber(a.issueDiscoveryScore);
+      if (scoreDiff !== 0) return scoreDiff;
+
+      const solvedDiff =
+        parseNumber(b.totalValidSolvedIssues ?? b.totalSolvedIssues) -
+        parseNumber(a.totalValidSolvedIssues ?? a.totalSolvedIssues);
+      if (solvedDiff !== 0) return solvedDiff;
+
+      const credibilityDiff =
+        parseNumber(b.issueCredibility) - parseNumber(a.issueCredibility);
+      if (credibilityDiff !== 0) return credibilityDiff;
+
+      return a.id - b.id;
+    })
+    .slice(0, 5)
+    .map((miner) => {
+      const solvedIssues = parseNumber(
+        miner.totalValidSolvedIssues ?? miner.totalSolvedIssues,
+      );
+      const issueCredibility = parseNumber(miner.issueCredibility);
+      const secondaryMetric =
+        solvedIssues > 0
+          ? formatIssueCount(solvedIssues, 'valid solve')
+          : `${Math.round(issueCredibility * 100)}%`;
+      const secondaryMetricLabel =
+        solvedIssues > 0 ? 'all-time context' : 'issue credibility';
+
+      return {
+        id: `baseline-${miner.githubId}`,
+        githubId: miner.githubId,
+        githubUsername: miner.githubUsername,
+        name: miner.githubUsername ?? miner.githubId,
+        avatarUsername: miner.githubUsername,
+        roleLabel: 'Baseline issue-eligible leader',
+        primaryMetric: formatWholeNumber(
+          parseNumber(miner.issueDiscoveryScore),
+        ),
+        primaryMetricLabel: 'baseline discovery score',
+        secondaryMetric,
+        secondaryMetricLabel,
+        repos: [],
+        href: getMinerDetailsHref(miner.githubId),
+        tone: 'neutral' as const,
+        issueCredibility,
+      };
+    });
+
+const mapDailyDiscoveryKpis = (
+  current: DailyActivitySnapshot,
+  previous: DailyActivitySnapshot,
+): DashboardDiscoveryKpi[] => [
+  {
+    label: 'Discovery solves',
+    value: formatWholeNumber(current.discoveryPrsMerged),
+    delta: formatDailyDelta(
+      current.discoveryPrsMerged,
+      previous.discoveryPrsMerged,
+    ),
+    tone: getDailyKpiTone(
+      current.discoveryPrsMerged,
+      previous.discoveryPrsMerged,
+    ),
+  },
+  {
+    label: 'Discovery score',
+    value: formatWholeNumber(current.discoveryScore),
+    delta: formatDailyDelta(current.discoveryScore, previous.discoveryScore),
+    tone: getDailyKpiTone(current.discoveryScore, previous.discoveryScore),
+  },
+  {
+    label: 'New linked issues',
+    value: formatWholeNumber(current.linkedIssuesOpened),
+    delta: formatDailyDelta(
+      current.linkedIssuesOpened,
+      previous.linkedIssuesOpened,
+    ),
+    tone: getDailyKpiTone(
+      current.linkedIssuesOpened,
+      previous.linkedIssuesOpened,
+    ),
+  },
+  {
+    label: 'Active discoverers',
+    value: formatWholeNumber(current.discoverers.size),
+    delta: formatDailyDelta(
+      current.discoverers.size,
+      previous.discoverers.size,
+    ),
+    tone: getDailyKpiTone(current.discoverers.size, previous.discoverers.size),
+  },
+  {
+    label: 'Repos touched',
+    value: formatWholeNumber(current.repos.size),
+    delta: formatDailyDelta(current.repos.size, previous.repos.size),
+    tone: getDailyKpiTone(current.repos.size, previous.repos.size),
+  },
+];
+
+export const buildDailyDiscoveryKpis = (
+  prs: CommitLog[],
+  miners: MinerEvaluation[],
+  now = new Date(),
+): DashboardDiscoveryKpi[] => {
+  const current = buildDailyActivitySnapshot(
+    prs,
+    miners,
+    getRollingWindowBounds(now),
+  );
+  const previous = buildDailyActivitySnapshot(
+    prs,
+    miners,
+    getPreviousRollingWindowBounds(now),
+  );
+
+  return mapDailyDiscoveryKpis(current, previous);
+};
+
+export const buildDailyDiscoveryPulse = (
+  prs: CommitLog[],
+  miners: MinerEvaluation[],
+  now = new Date(),
+): DashboardDiscoveryPulse => {
+  const currentSnapshot = buildDailyActivitySnapshot(
+    prs,
+    miners,
+    getRollingWindowBounds(now),
+  );
+  const previousSnapshot = buildDailyActivitySnapshot(
+    prs,
+    miners,
+    getPreviousRollingWindowBounds(now),
+  );
+  const dailyDiscoverers = buildDailyDiscovererRows(currentSnapshot);
+  const isFallback = dailyDiscoverers.length === 0;
+
+  return {
+    windowLabel: 'Last 24h',
+    kpis: mapDailyDiscoveryKpis(currentSnapshot, previousSnapshot),
+    discoverers: isFallback
+      ? buildBaselineDiscoverers(miners)
+      : dailyDiscoverers,
+    isFallback,
+  };
+};
+
+export const buildFeaturedDiscoverers = (
+  prs: CommitLog[],
+  miners: MinerEvaluation[],
+  now = new Date(),
+): DashboardFeaturedDiscoverer[] =>
+  buildDailyDiscoveryPulse(prs, miners, now).discoverers;
 
 const pickTopDiscoveryMiner = (
   prs: CommitLog[],

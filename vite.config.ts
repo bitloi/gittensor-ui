@@ -1,6 +1,11 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react-swc';
 
+const prodApiProxy = {
+  target: 'https://api.gittensor.io',
+  changeOrigin: true,
+} as const;
+
 // https://vitejs.dev/config/
 export default defineConfig({
   base: '/',
@@ -16,5 +21,16 @@ export default defineConfig({
     host: true, //set to true to make the server accessible on your network
     origin: 'http://127.0.0.1:8080',
     allowedHosts: ['test.gittensor.io', 'gittensor.io'],
+    proxy: {
+      '/api': {
+        ...prodApiProxy,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/mirror-api': {
+        target: 'https://mirror.gittensor.io/api/v1',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/mirror-api/, ''),
+      },
+    },
   },
 });
